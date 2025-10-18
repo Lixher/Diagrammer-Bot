@@ -1,0 +1,406 @@
+import logging
+import os
+import time
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, ConversationHandler,
+    MessageHandler, filters, ContextTypes
+)
+from telegram.error import BadRequest
+
+import config, database, nodes, edges, renderer
+import admin
+
+
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+
+(MAIN_MENU, ADD_NODE, ADD_EDGE_START, ADD_EDGE_END, MANAGE_NODES,
+ EDIT_NODE_TEXT, SETTINGS, MANAGE_EDGES, DIAGRAM_MENU, SAVE_DIAGRAM_NAME, LOAD_DIAGRAM) = range(11)
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+async def edit_or_send_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, keyboard: InlineKeyboardMarkup):
+    query = update.callback_query
+    if query and query.message.photo:
+        await query.message.delete()
+        await context.bot.send_message(chat_id=query.from_user.id, text=text, reply_markup=keyboard, parse_mode='HTML')
+    elif query:
+        try: await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode='HTML')
+        except BadRequest as e:
+            if "Message is not modified" not in str(e): raise e
+    else:
+        await context.bot.send_message(chat_id=update.effective_user.id, text=text, reply_markup=keyboard, parse_mode='HTML')
+
+async def edit_or_send_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, image_path: str, caption: str, keyboard: InlineKeyboardMarkup):
+    query = update.callback_query
+    with open(image_path, 'rb') as photo_for_media:
+        media = InputMediaPhoto(media=photo_for_media, caption=caption, parse_mode='HTML')
+        if query and query.message.photo:
+            try: await query.edit_message_media(media=media, reply_markup=keyboard)
+            except BadRequest as e:
+                if "Message is not modified" in str(e):
+                    await query.edit_message_caption(caption=caption, reply_markup=keyboard, parse_mode='HTML')
+        else:
+            if query: await query.message.delete()
+            with open(image_path, 'rb') as photo_for_send:
+                await context.bot.send_photo(chat_id=update.effective_user.id, photo=photo_for_send, caption=caption, reply_markup=keyboard, parse_mode='HTML')
+
+async def edit_menu(query: Update.callback_query, new_text: str, new_keyboard: InlineKeyboardMarkup):
+    if query.message.photo:
+        await query.edit_message_caption(caption=new_text, reply_markup=new_keyboard, parse_mode='HTML')
+    else:
+        await query.edit_message_text(text=new_text, reply_markup=new_keyboard, parse_mode='HTML')
+
+# --- ГЛАВНАЯ ФУНКЦИЯ ИНТЕРФЕЙСА ---
+async def update_diagram_view(update: Update, context: ContextTypes.DEFAULT_TYPE, message: str = ""):
+    user_id = update.effective_user.id
+    user_data = database.get_user_data(user_id)
+    diagram = user_data["diagrams"][user_data["active_diagram_name"]]
+    theme = user_data['settings'].get('theme', 'dark')
+    active_diagram_name = user_data['active_diagram_name']
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Блок", callback_data="add_node"), InlineKeyboardButton("✏️ Блоки", callback_data="manage_nodes")],
+        [InlineKeyboardButton("↔️ Связать", callback_data="add_edge"), InlineKeyboardButton("🔗 Связи", callback_data="manage_edges")],
+        [InlineKeyboardButton("💾 Диаграммы", callback_data="diagram_menu"), InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
+        [InlineKeyboardButton("📥 Скачать PNG", callback_data="generate_file")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    caption_prefix = f"📝 Редактируем: **{active_diagram_name}**\n{message}\n"
+    
+    if not diagram.get('edges'):
+        final_text = caption_prefix
+        if not diagram.get('nodes'):
+            final_text += "Диаграмма пуста. Отправьте текст или фото, чтобы создать первый блок."
+        else:
+            final_text += "Текущие блоки:\n"
+            for node in diagram['nodes']:
+                node_repr = f"«{node['content']}»" if node['type'] == 'text' else "[🖼️ Изображение]"
+                final_text += f"- {node_repr}\n"
+            final_text += "\nДобавьте связь (↔️ Связать), чтобы увидеть превью."
+        await edit_or_send_text(update, context, final_text, reply_markup)
+        return MAIN_MENU
+
+    image_path = renderer.render_diagram(diagram, user_id, theme)
+    if not image_path or os.path.getsize(image_path) == 0:
+        await context.bot.send_message(chat_id=user_id, text="❗️Критическая ошибка рендеринга. Попробуйте изменить диаграмму.")
+        if image_path: os.remove(image_path)
+        return MAIN_MENU
+
+    caption_text = caption_prefix + f"Блоков: {len(diagram['nodes'])} | Связей: {len(diagram['edges'])}"
+    await edit_or_send_photo(update, context, image_path, caption_text, reply_markup)
+    os.remove(image_path)
+    return MAIN_MENU
+
+# --- ОБРАБОТЧИКИ ДЕЙСТВИЙ ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    database.get_user_data(update.effective_user.id)
+    await update.message.reply_html(
+        rf"Привет, {update.effective_user.mention_html()}! Я бот для создания интерактивных диаграмм."
+        "\n\nОтправь мне **текст** или **фото**, чтобы создать первый блок."
+    )
+    return ADD_NODE
+
+async def add_node_text_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    user_data = database.get_user_data(user_id)
+    diagram = user_data["diagrams"][user_data["active_diagram_name"]]
+    nodes.add_node(diagram, 'text', update.message.text)
+    database.save_user_data(user_id, user_data)
+    await update_diagram_view(update, context, message=f"✅ Блок «{update.message.text}» добавлен!")
+    return MAIN_MENU
+
+async def add_node_photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    processing_message = await context.bot.send_message(chat_id=user_id, text="🖼️ Сохраняю изображение...")
+    photo = update.message.photo[-1]
+    photo_file = await photo.get_file()
+    file_name = f"{user_id}_{int(time.time())}.jpg"
+    file_path = os.path.join("user_images", file_name)
+    await photo_file.download_to_drive(file_path)
+
+    user_data = database.get_user_data(user_id)
+    diagram = user_data["diagrams"][user_data["active_diagram_name"]]
+    nodes.add_node(diagram, 'image', file_path)
+    database.save_user_data(user_id, user_data)
+
+    await processing_message.delete()
+    await update_diagram_view(update, context, message=f"✅ Блок с изображением добавлен!")
+    return MAIN_MENU
+
+async def back_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.callback_query.answer()
+    await update_diagram_view(update, context)
+    return MAIN_MENU
+
+async def add_node_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query; await query.answer()
+    await query.message.delete()
+    await context.bot.send_message(chat_id=query.from_user.id, text="Отправьте текст или фото для нового блока.")
+    return ADD_NODE
+
+async def manage_nodes_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query; await query.answer()
+    user_data = database.get_user_data(query.from_user.id)
+    diagram = user_data["diagrams"][user_data["active_diagram_name"]]
+    if not diagram['nodes']:
+        await query.answer("❗️ Нет блоков для управления.", show_alert=True)
+        return MAIN_MENU
+    keyboard = []
+    for node in diagram['nodes']:
+        if node['type'] == 'text':
+            content = node['content']
+            label_preview = f"«{(content[:20] + '..') if len(content) > 20 else content}»"
+            edit_button = InlineKeyboardButton("✏️", callback_data=f"edit_node_{node['id']}")
+        else:
+            label_preview = "[🖼️ Изображение]"
+            edit_button = InlineKeyboardButton(" ", callback_data="noop")
+        keyboard.append([
+            InlineKeyboardButton(label_preview, callback_data="noop"), edit_button,
+            InlineKeyboardButton("🗑️", callback_data=f"delete_node_{node['id']}")])
+    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")])
+    await edit_menu(query, "Управление блоками:", InlineKeyboardMarkup(keyboard))
+    return MANAGE_NODES
+
+async def delete_node_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query; await query.answer()
+    user_id = query.from_user.id
+    node_id = int(query.data.split('_')[2])
+    user_data = database.get_user_data(user_id)
+    diagram = user_data["diagrams"][user_data["active_diagram_name"]]
+    for node in diagram['nodes']:
+        if node['id'] == node_id and node['type'] == 'image':
+            if os.path.exists(node['content']): os.remove(node['content'])
+            break
+    nodes.delete_node(diagram, node_id)
+    database.save_user_data(user_id, user_data)
+    await update_diagram_view(update, context, message="✅ Блок удален.")
+    return MAIN_MENU
+
+async def edit_node_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query; await query.answer()
+    context.user_data['node_to_edit'] = int(query.data.split('_')[2])
+    await query.message.delete()
+    await context.bot.send_message(chat_id=query.from_user.id, text="Отправьте новый текст для блока.")
+    return EDIT_NODE_TEXT
+
+async def edit_node_text_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    node_id = context.user_data.pop('node_to_edit', None)
+    if node_id is None: return await update_diagram_view(update, context)
+    user_data = database.get_user_data(user_id)
+    diagram = user_data["diagrams"][user_data["active_diagram_name"]]
+    nodes.edit_node_text(diagram, node_id, update.message.text)
+    database.save_user_data(user_id, user_data)
+    await update_diagram_view(update, context, message=f"✅ Блок изменен.")
+    return MAIN_MENU
+
+async def add_edge_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query; await query.answer()
+    user_data = database.get_user_data(query.from_user.id)
+    diagram = user_data["diagrams"][user_data["active_diagram_name"]]
+    if len(diagram['nodes']) < 2:
+        await query.answer("❗️ Нужно как минимум 2 блока.", show_alert=True)
+        return MAIN_MENU
+    keyboard = []
+    for node in diagram['nodes']:
+        label = node['content'] if node['type'] == 'text' else "[🖼️ Изображение]"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"edge_start_{node['id']}")])
+    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")])
+    await edit_menu(query, "Выберите НАЧАЛЬНЫЙ блок:", InlineKeyboardMarkup(keyboard))
+    return ADD_EDGE_START
+
+async def add_edge_select_start_node(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query; await query.answer()
+    context.user_data['from_node_id'] = int(query.data.split('_')[2])
+    user_data = database.get_user_data(query.from_user.id)
+    diagram = user_data["diagrams"][user_data["active_diagram_name"]]
+    keyboard = []
+    for node in diagram['nodes']:
+        if node['id'] != context.user_data['from_node_id']:
+            label = node['content'] if node['type'] == 'text' else "[🖼️ Изображение]"
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"edge_end_{node['id']}")])
+    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")])
+    await edit_menu(query, "Выберите КОНЕЧНЫЙ блок:", InlineKeyboardMarkup(keyboard))
+    return ADD_EDGE_END
+
+async def add_edge_select_end_node(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query; await query.answer()
+    user_id = query.from_user.id
+    from_node_id = context.user_data.pop('from_node_id', None)
+    if from_node_id is None: return await update_diagram_view(update, context)
+    to_node_id = int(query.data.split('_')[2])
+    user_data = database.get_user_data(user_id)
+    diagram = user_data["diagrams"][user_data["active_diagram_name"]]
+    edges.add_edge(diagram, from_node_id, to_node_id)
+    database.save_user_data(user_id, user_data)
+    await update_diagram_view(update, context, message="✅ Связь добавлена.")
+    return MAIN_MENU
+
+async def manage_edges_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query; await query.answer()
+    user_data = database.get_user_data(query.from_user.id)
+    diagram = user_data["diagrams"][user_data["active_diagram_name"]]
+    if not diagram['edges']:
+        await query.answer("❗️ Нет связей для управления.", show_alert=True)
+        return MAIN_MENU
+    nodes_map = {node['id']: (node['content'] if node['type'] == 'text' else "[🖼️]") for node in diagram['nodes']}
+    keyboard = []
+    for edge in diagram['edges']:
+        from_label = nodes_map.get(edge['from'], '?'); to_label = nodes_map.get(edge['to'], '?')
+        keyboard.append([
+            InlineKeyboardButton(f"«{from_label}» → «{to_label}»", callback_data="noop"),
+            InlineKeyboardButton("🗑️", callback_data=f"delete_edge_{edge['from']}_{edge['to']}")])
+    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")])
+    await edit_menu(query, "Управление связями:", InlineKeyboardMarkup(keyboard))
+    return MANAGE_EDGES
+
+async def delete_edge_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query; await query.answer()
+    user_id = query.from_user.id
+    _, _, from_id, to_id = query.data.split('_')
+    user_data = database.get_user_data(user_id)
+    diagram = user_data["diagrams"][user_data["active_diagram_name"]]
+    edges.delete_edge(diagram, int(from_id), int(to_id))
+    database.save_user_data(user_id, user_data)
+    await update_diagram_view(update, context, message="✅ Связь удалена.")
+    return MAIN_MENU
+
+async def settings_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query; await query.answer()
+    user_data = database.get_user_data(query.from_user.id)
+    theme = user_data['settings'].get('theme', 'dark')
+    keyboard = [
+        [InlineKeyboardButton(f"{'✅' if theme == 'dark' else ''} 🌙 Тёмная", callback_data="set_theme_dark")],
+        [InlineKeyboardButton(f"{'✅' if theme == 'light' else ''} ☀️ Светлая", callback_data="set_theme_light")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")]]
+    await edit_menu(query, "Настройки темы:", InlineKeyboardMarkup(keyboard))
+    return SETTINGS
+
+async def set_theme_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query; await query.answer()
+    user_id = query.from_user.id
+    new_theme = query.data.split('_')[2]
+    user_data = database.get_user_data(user_id)
+    user_data['settings']['theme'] = new_theme
+    database.save_user_data(user_id, user_data)
+    await update_diagram_view(update, context, message=f"🎨 Тема изменена.")
+    return MAIN_MENU
+
+async def generate_file_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer("Готовлю файл...", show_alert=False)
+    user_id = query.from_user.id
+    user_data = database.get_user_data(user_id)
+    diagram = user_data["diagrams"][user_data["active_diagram_name"]]
+    theme = user_data['settings'].get('theme', 'dark')
+    image_path = renderer.render_diagram(diagram, user_id, theme)
+    if image_path and os.path.getsize(image_path) > 0:
+        with open(image_path, 'rb') as doc:
+            await context.bot.send_document(chat_id=user_id, document=doc, filename=f"diagram_{user_id}.png")
+        os.remove(image_path)
+    else:
+        await query.answer("❗️ Нечего скачивать. Диаграмма пуста или не содержит связей.", show_alert=True)
+
+async def diagram_menu_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query; await query.answer()
+    keyboard = [
+        [InlineKeyboardButton("💾 Сохранить текущую", callback_data="save_diagram")],
+        [InlineKeyboardButton("📂 Загрузить", callback_data="load_diagram_prompt")],
+        [InlineKeyboardButton("✨ Создать новую", callback_data="new_diagram")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")]]
+    await edit_menu(query, "Управление диаграммами:", InlineKeyboardMarkup(keyboard))
+    return DIAGRAM_MENU
+
+async def save_diagram_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query; await query.answer()
+    await query.message.delete()
+    await context.bot.send_message(chat_id=query.from_user.id, text="Введите имя для сохранения текущей диаграммы:")
+    return SAVE_DIAGRAM_NAME
+
+async def save_diagram_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    new_name = update.message.text
+    if database.save_active_diagram(user_id, new_name):
+        await update_diagram_view(update, context, message=f"✅ Диаграмма сохранена как «{new_name}»")
+    else:
+        await update_diagram_view(update, context, message=f"❗️ Диаграмма с таким именем уже существует.")
+    return MAIN_MENU
+
+async def load_diagram_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query; await query.answer()
+    saved_diagrams = database.list_saved_diagrams(query.from_user.id)
+    if not saved_diagrams:
+        await query.answer("❗️ Нет сохраненных диаграмм.", show_alert=True)
+        return DIAGRAM_MENU
+    keyboard = [[InlineKeyboardButton(name, callback_data=f"load_{name}")] for name in saved_diagrams]
+    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="diagram_menu_back")])
+    await edit_menu(query, "Выберите диаграмму для загрузки:", InlineKeyboardMarkup(keyboard))
+    return LOAD_DIAGRAM
+
+async def load_diagram_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query; await query.answer()
+    diagram_name = query.data[5:]
+    if database.set_active_diagram(query.from_user.id, diagram_name):
+        await update_diagram_view(update, context, message=f"📂 Загружена диаграмма «{diagram_name}»")
+    return MAIN_MENU
+
+async def new_diagram_action_from_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query; await query.answer()
+    new_name = database.create_new_diagram(query.from_user.id)
+    await update_diagram_view(update, context, message=f"✨ Создана новая пустая диаграмма «{new_name}»")
+    return MAIN_MENU
+
+async def noop(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.callback_query.answer()
+
+def main() -> None:
+    application = Application.builder().token(config.BOT_TOKEN).build()
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            MAIN_MENU: [
+                CallbackQueryHandler(add_node_prompt, pattern="^add_node$"),
+                CallbackQueryHandler(manage_nodes_prompt, pattern="^manage_nodes$"),
+                CallbackQueryHandler(add_edge_prompt, pattern="^add_edge$"),
+                CallbackQueryHandler(manage_edges_prompt, pattern="^manage_edges$"),
+                CallbackQueryHandler(settings_prompt, pattern="^settings$"),
+                CallbackQueryHandler(diagram_menu_prompt, pattern="^diagram_menu$"),
+                CallbackQueryHandler(generate_file_action, pattern="^generate_file$"),
+            ],
+            ADD_NODE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_node_text_received),
+                MessageHandler(filters.PHOTO, add_node_photo_received),
+            ],
+            MANAGE_NODES: [
+                CallbackQueryHandler(delete_node_action, pattern="^delete_node_"),
+                CallbackQueryHandler(edit_node_prompt, pattern="^edit_node_"),
+                CallbackQueryHandler(back_to_main_menu, pattern="^back_to_main$"),
+                CallbackQueryHandler(noop, pattern="^noop$"),
+            ],
+            EDIT_NODE_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_node_text_received)],
+            ADD_EDGE_START: [CallbackQueryHandler(add_edge_select_start_node, pattern="^edge_start_"), CallbackQueryHandler(back_to_main_menu, pattern="^back_to_main$")],
+            ADD_EDGE_END: [CallbackQueryHandler(add_edge_select_end_node, pattern="^edge_end_"), CallbackQueryHandler(back_to_main_menu, pattern="^back_to_main$")],
+            MANAGE_EDGES: [CallbackQueryHandler(delete_edge_action, pattern="^delete_edge_"), CallbackQueryHandler(back_to_main_menu, pattern="^back_to_main$")],
+            SETTINGS: [CallbackQueryHandler(set_theme_action, pattern="^set_theme_"), CallbackQueryHandler(back_to_main_menu, pattern="^back_to_main$")],
+            DIAGRAM_MENU: [
+                CallbackQueryHandler(save_diagram_prompt, pattern="^save_diagram$"),
+                CallbackQueryHandler(load_diagram_prompt, pattern="^load_diagram_prompt$"),
+                CallbackQueryHandler(new_diagram_action_from_menu, pattern="^new_diagram$"),
+                CallbackQueryHandler(back_to_main_menu, pattern="^back_to_main$"),
+            ],
+            SAVE_DIAGRAM_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_diagram_name_received)],
+            LOAD_DIAGRAM: [
+                CallbackQueryHandler(load_diagram_action, pattern="^load_"),
+                CallbackQueryHandler(diagram_menu_prompt, pattern="^diagram_menu_back$")
+            ]
+        },
+        fallbacks=[CommandHandler("start", start)],
+        per_message=False
+    )
+    application.add_handler(conv_handler)
+    application.add_handler(CommandHandler("users", admin.users_command))
+    print("Бот запущен. Финальная отлаженная версия.")
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
