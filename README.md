@@ -5,7 +5,7 @@
 <p align="center">
   <img src="https://github.com/user-attachments/assets/c32b1788-a330-4833-88cc-03215171edd0" width="400" alt="Пример темной темы">
   &nbsp;&nbsp;&nbsp;&nbsp;
-  <img src="ССЫЛКА_НА_ТВОЮ_СВЕТЛУЮ_ТЕМУ" width="400" alt="https://github.com/user-attachments/assets/228a001c-f9cb-483c-a6f9-5ec7ff25e7b2">
+  <img src="https://github.com/user-attachments/assets/228a001c-f9cb-483c-a6f9-5ec7ff25e7b2" width="400" alt="Светлая">
 </p>
 
 ---
