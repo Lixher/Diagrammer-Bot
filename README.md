@@ -72,8 +72,6 @@ Graphviz — это "движок", который рисует диаграмм
    git clone https://github.com/Lixher/diagrammer-bot.git
    cd diagrammer-bot
    ```
-   *(Замените `Lixher` на свой никнейм, если нужно)*
-
 > 💡 Можно просто скачать ZIP-архив с GitHub и распаковать вручную.
 
 ---
