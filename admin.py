@@ -7,7 +7,7 @@ from telegram.ext import ContextTypes
 
 # --- НАСТРОЙКИ ---
 # Вставь сюда свой Telegram User ID
-ADMIN_USER_ID = 123123123 
+ADMIN_USER_ID = 123123123 #(свой айди) 
 # Путь к файлу нашей базы данных
 DB_FILE = "user_diagrams.json"
 
@@ -57,4 +57,5 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(message, parse_mode='HTML')
 
     except Exception as e:
+
         await update.message.reply_text(f"Произошла ошибка при чтении базы данных: {e}")
