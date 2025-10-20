@@ -25,6 +25,7 @@
 ---
 
 **Протестировать:** [Diagrammer Bot](https://t.me/diagrammer_robot)
+---
 **Release:** [Stable Version](https://github.com/Lixher/Diagrammer-Bot/releases)
 
 ---
